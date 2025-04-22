@@ -1,0 +1,142 @@
+from flask import Flask, request, jsonify
+import requests
+import json
+import os
+
+app = Flask(__name__)
+
+ACCESS_TOKEN = 'APP_USR-3217936625303024-041117-719141a8c5cfa8897a2e3dc22d59f79d-1433246274'
+
+MACHINE_MAP = {
+    '8701372447323147': 'http://192.168.5.11/api',
+    'MP300-23020562023041807721': 'http://192.168.5.5/api'
+}
+
+PAGAMENTOS_JSON = 'pagamentos.json'
+MAX_REGISTROS = 100
+
+
+def carregar_pagamentos_salvos():
+    if os.path.exists(PAGAMENTOS_JSON):
+        try:
+            with open(PAGAMENTOS_JSON, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Erro ao carregar JSON: {e}")
+    return []
+
+
+def salvar_pagamento(payment_id):
+    pagamentos = carregar_pagamentos_salvos()
+    
+    if payment_id in [p["id"] for p in pagamentos]:
+        print("⚠️ Pagamento já registrado. Ignorando duplicata.")
+        return False
+
+    novo = {"id": payment_id}
+    pagamentos.append(novo)
+
+    if len(pagamentos) > MAX_REGISTROS:
+        pagamentos = pagamentos[-MAX_REGISTROS:]
+
+    with open(PAGAMENTOS_JSON, 'w') as f:
+        json.dump(pagamentos, f, indent=2)
+
+    return True
+
+
+@app.route('/webhook', methods=['POST', 'GET'])
+def webhook():
+    if request.method == 'GET':
+        topic = request.args.get('topic')
+        payment_id = request.args.get('id')
+        print(f"GET recebido - topic: {topic}, id: {payment_id}")
+        return jsonify({'status': 'GET recebido'}), 200
+
+    elif request.method == 'POST':
+        print("Headers:", dict(request.headers))
+        print("Args (query string):", request.args)
+        print("Form (x-www-form-urlencoded):", request.form)
+        print("Body JSON (get_json):", request.get_json(silent=True))
+
+        data_json = request.get_json(silent=True)
+        topic = None
+        payment_id = None
+
+        if data_json:
+            topic = data_json.get('topic')
+            payment_id = data_json.get('resource')
+
+        if not topic or not payment_id:
+            topic = request.form.get('topic') or request.args.get('topic')
+            payment_id = request.form.get('id') or request.args.get('id')
+
+        if not topic or not payment_id:
+            return jsonify({'error': 'ID do pagamento ou tópico não encontrados.'}), 400
+
+        print(f"Recebido POST - topic: {topic}, id: {payment_id}")
+
+        # 🔍 Busca detalhes do pagamento antes de verificar duplicidade
+        payment_info = buscar_detalhes_pagamento(payment_id)
+        if not payment_info:
+            return jsonify({'error': 'Não foi possível obter detalhes do pagamento.'}), 400
+
+        real_payment_id = str(payment_info.get('id'))
+
+        # ⚠️ Verifica duplicidade com ID verdadeiro
+        if not salvar_pagamento(real_payment_id):
+            return jsonify({'status': 'Pagamento já processado'}), 200
+
+        machine_serial = payment_info.get('point_of_interaction', {}).get('device', {}).get('serial_number')
+        if not machine_serial:
+            return jsonify({'error': 'Número de série da máquina não encontrado.'}), 400
+
+        print(f"📟 Serial da máquina: {machine_serial}")
+
+        status = payment_info.get('status')
+        valor_pago = payment_info.get('transaction_amount', 0)
+        esp32_url = MACHINE_MAP.get(machine_serial)
+
+        if not esp32_url:
+            return jsonify({'error': f'Máquina com serial {machine_serial} não está cadastrada.'}), 400
+
+        signal = 'credito_disponivel' if status == 'approved' else 'credito_indisponivel'
+
+        try:
+            response = requests.post(esp32_url, json={
+                'signal': signal,
+                'valor_pago': valor_pago
+            }, headers={'Content-Type': 'application/json'})
+
+            if response.status_code == 200:
+                print(f"✅ Enviado ao ESP32 ({esp32_url}): {signal} - Valor: {valor_pago}")
+            else:
+                print(f"❌ Erro ao enviar para o ESP32 ({esp32_url}): {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Erro ao comunicar com o ESP32 ({esp32_url}): {e}")
+
+        return jsonify({'status': 'Pagamento processado com sucesso'}), 200
+
+
+def buscar_detalhes_pagamento(payment_id):
+    url = f'https://api.mercadopago.com/v1/payments/{payment_id}'
+    headers = {
+        'Authorization': f'Bearer {ACCESS_TOKEN}'
+    }
+
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            print("🧾 Detalhes do pagamento obtidos com sucesso.")
+            return response.json()
+        else:
+            print(f"Erro ao buscar pagamento: {response.status_code} - {response.text}")
+            return None
+    except requests.RequestException as e:
+        print(f"Erro ao conectar com a API do Mercado Pago: {e}")
+        return None
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+
